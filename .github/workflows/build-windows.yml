@@ -18,7 +18,7 @@ concurrency:
 
 jobs:
   windows:
-    runs-on: windows-2025
+    runs-on: windows-2022
     timeout-minutes: 350
     env:
       APOSTATE_TARGET: windows-x64
