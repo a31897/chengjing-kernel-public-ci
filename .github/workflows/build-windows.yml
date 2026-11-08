@@ -1,0 +1,151 @@
+name: Experimental Windows Kernel
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/build-windows.yml
+      - source-bundle.zip
+      - source-bundle.sha256
+
+permissions:
+  contents: read
+
+concurrency:
+  group: chengjing-kernel-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    runs-on: windows-2025
+    timeout-minutes: 350
+    env:
+      APOSTATE_TARGET: windows-x64
+      APOSTATE_FRESH_BUILD: '1'
+      APOSTATE_JOBS: '2'
+      DEPOT_TOOLS_UPDATE: '0'
+      DEPOT_TOOLS_WIN_TOOLCHAIN: '0'
+      PYTHONUNBUFFERED: '1'
+    steps:
+      - name: Checkout build inputs
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Verify bundle and runner resources
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expected = (Get-Content -LiteralPath source-bundle.sha256 -Raw).Trim().ToLowerInvariant()
+          if ($expected -notmatch '^[a-f0-9]{64}$') { throw 'Invalid bundle digest' }
+          $actual = (Get-FileHash -LiteralPath source-bundle.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $expected) { throw 'Source bundle SHA-256 mismatch' }
+          $ram = (Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB
+          if ($ram -lt 12) { throw 'Runner needs at least 12 GiB RAM. No paid runner or billing changes are made.' }
+          $drives = @([System.IO.DriveInfo]::GetDrives() | Where-Object { $_.IsReady -and $_.DriveType -eq 'Fixed' } | Sort-Object AvailableFreeSpace -Descending)
+          foreach ($item in $drives) { Write-Host ("Drive {0}: {1:N1} GiB free" -f $item.Name, ($item.AvailableFreeSpace / 1GB)) }
+          if ($drives.Count -eq 0) { throw 'No fixed build volume is available' }
+          if (($drives[0].AvailableFreeSpace / 1GB) -lt 75 -and $env:GITHUB_ACTIONS -eq 'true' -and $env:RUNNER_ENVIRONMENT -eq 'github-hosted' -and $env:AGENT_TOOLSDIRECTORY) {
+            $tools = [System.IO.Path]::GetFullPath($env:AGENT_TOOLSDIRECTORY).TrimEnd('\')
+            $codeql = [System.IO.Path]::GetFullPath((Join-Path $tools 'CodeQL'))
+            if (-not $codeql.StartsWith($tools+'\',[StringComparison]::OrdinalIgnoreCase) -or [System.IO.Path]::GetFileName($codeql) -ne 'CodeQL') { throw 'Unsafe ephemeral cache path' }
+            if (Test-Path -LiteralPath $codeql) {
+              $cache = Get-Item -LiteralPath $codeql -Force
+              if ($cache.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Refusing a linked cache path' }
+              Write-Host "Removing only unused CodeQL cache from this ephemeral GitHub-hosted runner: $codeql"
+              Remove-Item -LiteralPath $codeql -Recurse -Force
+            }
+            $drives = @([System.IO.DriveInfo]::GetDrives() | Where-Object { $_.IsReady -and $_.DriveType -eq 'Fixed' } | Sort-Object AvailableFreeSpace -Descending)
+          }
+          $drive = $drives[0]
+          $free = $drive.AvailableFreeSpace / 1GB
+          Write-Host "Selected disk: $($drive.Name); available disk: $free GiB; RAM: $ram GiB"
+          "Selected disk: $($drive.Name); available disk: $free GiB; RAM: $ram GiB" | Add-Content $env:GITHUB_STEP_SUMMARY
+          if ($free -lt 75 -or $ram -lt 12) { throw 'Runner needs at least 75 GiB free and 12 GiB RAM. No paid runner or billing changes are made.' }
+          $workspace = (Join-Path $drive.RootDirectory.FullName ("chengjing-ci-" + $env:GITHUB_RUN_ID)) -replace '\\','/'
+          "APOSTATE_WORKSPACE=$workspace" | Add-Content $env:GITHUB_ENV
+          Expand-Archive -LiteralPath source-bundle.zip -DestinationPath bundle
+      - name: Checkout exact reviewed upstream
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: aliasmode/aliasmode-chromium
+          ref: 9f6679274b7e87c943b28104921b1a8d6bc30666
+          path: engine
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Verify pinned source and append overlay
+        shell: pwsh
+        run: node bundle/ci/prepare.mjs engine
+      - name: Provision pinned Windows SDK and toolchain
+        shell: bash
+        working-directory: engine
+        run: bash scripts/provision-windows-toolchain.sh
+      - name: Verify build tooling
+        shell: bash
+        working-directory: engine
+        run: bash scripts/verify-host-tooling.sh windows-x64
+      - name: Bootstrap pinned depot tools
+        shell: bash
+        working-directory: engine
+        run: bash scripts/bootstrap.sh
+      - name: Fetch exact Chromium and dependencies
+        shell: bash
+        working-directory: engine
+        run: bash scripts/fetch-sources.sh
+      - name: Apply complete series including native fix
+        shell: bash
+        working-directory: engine
+        run: bash scripts/apply-patches.sh
+      - name: Configure Windows build
+        shell: bash
+        working-directory: engine
+        run: bash scripts/configure.sh windows-x64
+      - name: Compile full native kernel
+        id: kernel_build
+        shell: bash
+        working-directory: engine
+        run: bash scripts/build.sh windows-x64
+      - name: Verify binary version resource
+        shell: bash
+        working-directory: engine
+        run: bash scripts/smoke-binary.sh windows-x64
+      - name: Package experimental candidate
+        shell: bash
+        working-directory: engine
+        run: bash scripts/package-artifact.sh windows-x64 "$GITHUB_WORKSPACE/aliasmode-chromium-155.0.8059.85-windows-x64.zip"
+      - name: Record candidate boundary and actual kernel hashes
+        shell: pwsh
+        run: |
+          $files = @{}
+          foreach ($name in @('chrome.exe','chrome.dll','chrome_elf.dll','libEGL.dll','libGLESv2.dll')) {
+            $path = Join-Path "$env:APOSTATE_WORKSPACE/src/out/windows-x64" $name
+            if (Test-Path -LiteralPath $path) { $files[$name] = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant() }
+          }
+          @{ validated = $false; status = 'experimental-candidate'; upstreamRevision = '9f6679274b7e87c943b28104921b1a8d6bc30666'; runId = $env:GITHUB_RUN_ID; files = $files; overlays = @('0174','0176','0177'); limitations = @('0174 fixes only the positive-size cutoff','0176 honors explicit Canvas/WebGL restrictions in workers','0177 separates image-only policy from font/audio umbrella noise','Known-pixel provenance repair and WebGPU rendered independence remain unimplemented','Requires headed real-GPU acceptance before adoption') } | ConvertTo-Json -Depth 5 | Set-Content candidate-provenance.json -Encoding utf8
+      - name: Measure actual browser rendering
+        shell: pwsh
+        run: node bundle/ci/render-smoke.mjs "$env:APOSTATE_WORKSPACE/src/out/windows-x64/chrome.exe" rendering-results.json --image-only-noise
+      - name: Verify explicit native restrictions across all contexts
+        if: ${{ !cancelled() && steps.kernel_build.outcome == 'success' }}
+        shell: pwsh
+        run: node bundle/ci/render-smoke.mjs "$env:APOSTATE_WORKSPACE/src/out/windows-x64/chrome.exe" rendering-results-restrictions.json --block-hardware
+      - name: Upload candidate and evidence, not a validated release
+        if: always()
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808
+        with:
+          name: experimental-windows-${{ github.run_id }}
+          retention-days: 3
+          if-no-files-found: warn
+          path: |
+            aliasmode-chromium-155.0.8059.85-windows-x64.zip
+            aliasmode-chromium-155.0.8059.85-windows-x64.zip.manifest.json
+            candidate-provenance.json
+            engine/build/MANIFEST.lock
+            rendering-results.json
+            rendering-results-restrictions.json
+            bundle/build-inputs.json
+      - name: State validation boundary
+        if: always()
+        shell: pwsh
+        run: |
+          'Experimental candidate only. Compilation is not rendering acceptance. Headless CI is not a real-GPU desktop baseline. Existing installed browsers were not replaced.' | Add-Content $env:GITHUB_STEP_SUMMARY
