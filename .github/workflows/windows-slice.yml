@@ -1,0 +1,216 @@
+name: Bounded Windows Compile Slice
+
+on:
+  workflow_call:
+    inputs:
+      slice:
+        type: number
+        required: true
+    outputs:
+      state:
+        value: ${{ jobs.windows.outputs.state }}
+      cache_saved:
+        value: ${{ jobs.windows.outputs.cache_saved }}
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 350
+    outputs:
+      state: ${{ steps.kernel_build.outputs.state }}
+      cache_saved: ${{ steps.confirm_cache.outputs.cache-hit }}
+    env:
+      APOSTATE_TARGET: windows-x64
+      APOSTATE_FRESH_BUILD: '1'
+      APOSTATE_JOBS: '4'
+      DEPOT_TOOLS_UPDATE: '0'
+      DEPOT_TOOLS_WIN_TOOLCHAIN: '0'
+      PYTHONUNBUFFERED: '1'
+      VSLANG: '1033'
+      SCCACHE_CACHE_SIZE: 8G
+      SCCACHE_IDLE_TIMEOUT: '0'
+      SCCACHE_SERVER_STARTUP_TIMEOUT: '120'
+    steps:
+      - name: Checkout build inputs
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Verify bundle and runner resources
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:GITHUB_REPOSITORY -ne 'a31897/chengjing-kernel-public-ci' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted') { throw 'This plan is limited to the approved public repository and standard hosted runner' }
+          "CI_JOB_STARTED_MS=$([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())" | Add-Content $env:GITHUB_ENV
+          "APOSTATE_JOBS=$([Math]::Min(4,[Environment]::ProcessorCount))" | Add-Content $env:GITHUB_ENV
+          "SCCACHE_DIR=$(Join-Path $env:RUNNER_TEMP 'chengjing-compiler-cache')" | Add-Content $env:GITHUB_ENV
+          $expected = (Get-Content -LiteralPath source-bundle.sha256 -Raw).Trim().ToLowerInvariant()
+          if ($expected -notmatch '^[a-f0-9]{64}$') { throw 'Invalid bundle digest' }
+          $actual = (Get-FileHash -LiteralPath source-bundle.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $expected) { throw 'Source bundle SHA-256 mismatch' }
+          $ram = (Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB
+          if ($ram -lt 12) { throw 'Runner needs at least 12 GiB RAM. No paid runner or billing changes are made.' }
+          $drives = @([System.IO.DriveInfo]::GetDrives() | Where-Object { $_.IsReady -and $_.DriveType -eq 'Fixed' } | Sort-Object AvailableFreeSpace -Descending)
+          foreach ($item in $drives) { Write-Host ("Drive {0}: {1:N1} GiB free" -f $item.Name, ($item.AvailableFreeSpace / 1GB)) }
+          if ($drives.Count -eq 0) { throw 'No fixed build volume is available' }
+          if (($drives[0].AvailableFreeSpace / 1GB) -lt 100 -and $env:GITHUB_ACTIONS -eq 'true' -and $env:RUNNER_ENVIRONMENT -eq 'github-hosted' -and $env:AGENT_TOOLSDIRECTORY) {
+            $tools = [System.IO.Path]::GetFullPath($env:AGENT_TOOLSDIRECTORY).TrimEnd('\')
+            $codeql = [System.IO.Path]::GetFullPath((Join-Path $tools 'CodeQL'))
+            if (-not $codeql.StartsWith($tools+'\',[StringComparison]::OrdinalIgnoreCase) -or [System.IO.Path]::GetFileName($codeql) -ne 'CodeQL') { throw 'Unsafe ephemeral cache path' }
+            if (Test-Path -LiteralPath $codeql) {
+              $cache = Get-Item -LiteralPath $codeql -Force
+              if ($cache.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Refusing a linked cache path' }
+              Write-Host "Removing only unused CodeQL cache from this ephemeral GitHub-hosted runner: $codeql"
+              Remove-Item -LiteralPath $codeql -Recurse -Force
+            }
+            $drives = @([System.IO.DriveInfo]::GetDrives() | Where-Object { $_.IsReady -and $_.DriveType -eq 'Fixed' } | Sort-Object AvailableFreeSpace -Descending)
+          }
+          $drive = $drives[0]
+          $free = $drive.AvailableFreeSpace / 1GB
+          Write-Host "Selected disk: $($drive.Name); available disk: $free GiB; RAM: $ram GiB"
+          "Selected disk: $($drive.Name); available disk: $free GiB; RAM: $ram GiB" | Add-Content $env:GITHUB_STEP_SUMMARY
+          if ($free -lt 100 -or $ram -lt 12) { throw 'Runner needs at least 100 GiB free including cache/archive headroom and 12 GiB RAM. No paid runner or billing changes are made.' }
+          # Stable ephemeral path avoids needless path-based compiler cache misses.
+          $workspace = (Join-Path $drive.RootDirectory.FullName 'chengjing-ci') -replace '\\','/'
+          "APOSTATE_WORKSPACE=$workspace" | Add-Content $env:GITHUB_ENV
+          Expand-Archive -LiteralPath source-bundle.zip -DestinationPath bundle
+      - name: Checkout exact reviewed upstream
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: aliasmode/aliasmode-chromium
+          ref: 9f6679274b7e87c943b28104921b1a8d6bc30666
+          path: engine
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Verify pinned source and append overlay
+        shell: pwsh
+        run: node bundle/ci/prepare.mjs engine
+      - name: Configure compiler transport without disabling official optimization
+        shell: pwsh
+        run: node bundle/ci/cache-policy.mjs configure engine
+      - name: Install hash-pinned compiler cache
+        shell: pwsh
+        run: ./bundle/ci/install-cache.ps1 -ToolsRoot $env:RUNNER_TEMP
+      - name: Provision pinned Windows SDK and toolchain
+        shell: bash
+        working-directory: engine
+        run: bash scripts/provision-windows-toolchain.sh
+      - name: Verify build tooling
+        shell: bash
+        working-directory: engine
+        run: bash scripts/verify-host-tooling.sh windows-x64
+      - name: Bootstrap pinned depot tools
+        shell: bash
+        working-directory: engine
+        run: bash scripts/bootstrap.sh
+      - name: Fetch exact Chromium and dependencies
+        shell: bash
+        working-directory: engine
+        run: bash scripts/fetch-sources.sh
+      - name: Apply complete series including native fix
+        shell: bash
+        working-directory: engine
+        run: bash scripts/apply-patches.sh
+      - name: Configure Windows build
+        shell: bash
+        working-directory: engine
+        run: bash scripts/configure.sh windows-x64
+      - name: Identify exact compiler cache namespace
+        id: cache_key
+        shell: pwsh
+        run: node bundle/ci/cache-policy.mjs key engine "$env:APOSTATE_WORKSPACE"
+      - name: Restore bounded compiler cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: ${{ env.SCCACHE_DIR }}
+          key: ${{ steps.cache_key.outputs.prefix }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.slice }}
+          restore-keys: ${{ steps.cache_key.outputs.prefix }}-
+      - name: Prove cached and direct compiler objects agree
+        id: cache_control
+        shell: pwsh
+        run: node bundle/ci/cache-policy.mjs preflight engine "$env:APOSTATE_WORKSPACE"
+      - name: Compile full native kernel within a checkpoint budget
+        id: kernel_build
+        shell: pwsh
+        run: node bundle/ci/bounded-build.mjs engine
+      - name: Flush cache and record actual hit statistics
+        id: cache_flush
+        if: ${{ always() && steps.cache_control.outcome == 'success' }}
+        shell: pwsh
+        run: |
+          sccache --show-stats --stats-format=json | Set-Content compiler-cache-stats.json -Encoding utf8
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot read compiler cache statistics' }
+          sccache --stop-server
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot flush compiler cache' }
+          node bundle/ci/cache-policy.mjs check-stats
+          if ($LASTEXITCODE -ne 0) { throw 'Insufficient useful cache entries; do not repeat the cold build' }
+      - name: Save compiler cache before the runner is destroyed
+        id: save_cache
+        if: ${{ !cancelled() && steps.cache_flush.outcome == 'success' && (steps.kernel_build.outputs.state == 'checkpoint' || steps.kernel_build.outputs.state == 'complete') }}
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: ${{ env.SCCACHE_DIR }}
+          key: ${{ steps.cache_key.outputs.prefix }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.slice }}
+      - name: Confirm the checkpoint actually exists before allowing continuation
+        id: confirm_cache
+        if: ${{ !cancelled() && steps.save_cache.outcome == 'success' }}
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: ${{ env.SCCACHE_DIR }}
+          key: ${{ steps.cache_key.outputs.prefix }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.slice }}
+          lookup-only: true
+      - name: Verify binary version resource
+        if: ${{ success() && steps.kernel_build.outputs.state == 'complete' }}
+        shell: bash
+        working-directory: engine
+        run: bash scripts/smoke-binary.sh windows-x64
+      - name: Package experimental candidate
+        if: ${{ success() && steps.kernel_build.outputs.state == 'complete' }}
+        shell: bash
+        working-directory: engine
+        run: bash scripts/package-artifact.sh windows-x64 "$GITHUB_WORKSPACE/aliasmode-chromium-155.0.8059.85-windows-x64.zip"
+      - name: Record candidate boundary and actual kernel hashes
+        if: ${{ success() && steps.kernel_build.outputs.state == 'complete' }}
+        shell: pwsh
+        run: |
+          $files = @{}
+          foreach ($name in @('chrome.exe','chrome.dll','chrome_elf.dll','libEGL.dll','libGLESv2.dll')) {
+            $path = Join-Path "$env:APOSTATE_WORKSPACE/src/out/windows-x64" $name
+            if (Test-Path -LiteralPath $path) { $files[$name] = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant() }
+          }
+          @{ validated = $false; status = 'experimental-candidate'; upstreamRevision = '9f6679274b7e87c943b28104921b1a8d6bc30666'; runId = $env:GITHUB_RUN_ID; slice = '${{ inputs.slice }}'; compilerCache = 'sccache-0.19.0'; files = $files; overlays = @('0174','0176','0177','0178'); limitations = @('0174 fixes only the positive-size cutoff','0176 honors explicit Canvas/WebGL restrictions in workers','0177 separates image-only policy from font/audio umbrella noise','0178 bounds Windows ThinLTO workers without disabling PGO or ThinLTO','Compiler-cache reuse is not an independent clean-build reproducibility proof','Known-pixel provenance repair and WebGPU rendered independence remain unimplemented','Requires headed real-GPU acceptance before adoption') } | ConvertTo-Json -Depth 5 | Set-Content candidate-provenance.json -Encoding utf8
+      - name: Measure actual browser rendering
+        if: ${{ success() && steps.kernel_build.outputs.state == 'complete' }}
+        shell: pwsh
+        run: node bundle/ci/render-smoke.mjs "$env:APOSTATE_WORKSPACE/src/out/windows-x64/chrome.exe" rendering-results.json --image-only-noise
+      - name: Verify explicit native restrictions across all contexts
+        if: ${{ !cancelled() && steps.kernel_build.outputs.state == 'complete' }}
+        shell: pwsh
+        run: node bundle/ci/render-smoke.mjs "$env:APOSTATE_WORKSPACE/src/out/windows-x64/chrome.exe" rendering-results-restrictions.json --block-hardware
+      - name: Upload candidate and evidence, not a validated release
+        if: always()
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808
+        with:
+          name: experimental-windows-${{ github.run_id }}-slice-${{ inputs.slice }}
+          retention-days: 3
+          if-no-files-found: warn
+          path: |
+            aliasmode-chromium-155.0.8059.85-windows-x64.zip
+            aliasmode-chromium-155.0.8059.85-windows-x64.zip.manifest.json
+            candidate-provenance.json
+            engine/build/MANIFEST.lock
+            rendering-results.json
+            rendering-results-restrictions.json
+            bundle/build-inputs.json
+            build-state.json
+            native-build.log
+            cache-preflight.json
+            compiler-cache-stats.json
+      - name: State validation boundary
+        if: always()
+        shell: pwsh
+        run: |
+          'Slice ${{ inputs.slice }} state: ${{ steps.kernel_build.outputs.state }}; checkpoint persisted: ${{ steps.confirm_cache.outputs.cache-hit }}. Experimental candidate only. Compilation is not rendering acceptance. Headless CI is not a real-GPU desktop baseline. Existing installed browsers were not replaced.' | Add-Content $env:GITHUB_STEP_SUMMARY
+          if ('${{ steps.kernel_build.outputs.state }}' -eq 'checkpoint' -and ('${{ steps.confirm_cache.outputs.cache-hit }}' -ne 'true' -or '${{ inputs.slice }}' -eq '3')) { throw 'Build is incomplete. No verified checkpoint or bounded continuation budget remains; do not label this a successful full build.' }
